@@ -9,6 +9,7 @@ import os
 import json
 import pickle
 from fastembed import TextEmbedding
+import requests
 import faiss
 import numpy as np
 from tqdm import tqdm
@@ -71,7 +72,8 @@ def create_json_vectors():
     print("Loading forum posts...")
     
     # Initialize the sentence transformer model
-    model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+    text_model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+
     
     # Load forum data
     with open("tds_forum_posts_filtered.json", "r", encoding="utf-8") as f:
@@ -92,18 +94,21 @@ def create_json_vectors():
                 "url": post["url"],
                 "search_text": search_text
             })
+
         except Exception as e:
             print(f"Error processing post {post.get('id', 'unknown')}: {str(e)}")
     
     print(f"Creating embeddings for {len(texts)} forum posts...")
     
     # Create embeddings
-    embeddings = np.array(list(model.embed(texts)), dtype='float32')
-    
-    # Create FAISS index
-    dimension = embeddings.shape[1]
+    text_embeddings = np.array(list(text_model.embed(texts)), dtype='float32')
+
+    print(f"Saving {len(text_embeddings)} total embeddings...")
+
+    # Save FAISS index
+    dimension = text_embeddings.shape[1]
     index = faiss.IndexFlatL2(dimension)
-    index.add(np.array(embeddings).astype('float32'))
+    index.add(text_embeddings)
     
     # Save index and metadata
     print("Saving forum index and metadata...")

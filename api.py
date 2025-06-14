@@ -19,6 +19,7 @@ import pickle
 import google.generativeai as genai
 from dotenv import load_dotenv
 import re
+import shutil
 import time
 
 # Load environment variables
@@ -213,6 +214,14 @@ Sources:"""
 
 Sources:"""
 
+@app.get("/disk-usage")
+def get_disk_usage():
+    total, used, free = shutil.disk_usage("/")
+    return JSONResponse({
+        "total_gb": round(total / (1024**3), 2),
+        "used_gb": round(used / (1024**3), 2),
+        "free_gb": round(free / (1024**3), 2),
+    })
 
 @app.post("/api/")
 async def answer_question(request: Request, background_tasks: BackgroundTasks):

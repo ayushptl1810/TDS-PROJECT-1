@@ -1,0 +1,13 @@
+markdownify
+playwright
+beautifulsoup4
+requests
+python-dotenv
+onnxruntime 
+numpy 
+fastembed 
+faiss-cpu
+fastapi
+google-generativeai
+uvicorn
+uvloop

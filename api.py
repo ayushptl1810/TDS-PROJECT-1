@@ -8,11 +8,8 @@ and maintains a vector store of course content and forum posts for context.
 
 import os
 import json
-import asyncio
-import sys
-from datetime import datetime
-from typing import List, Dict, Optional, Union
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from typing import List, Dict
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastembed import TextEmbedding
@@ -21,8 +18,6 @@ import numpy as np
 import pickle
 import google.generativeai as genai
 from dotenv import load_dotenv
-from queue import Queue
-import threading
 import re
 import time
 
@@ -41,9 +36,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global request queue and lock for thread safety
-request_queue = Queue()
-request_lock = threading.Lock()
+search_engine = None
+
+# ✅ NEW: FastAPI startup hook to preload everything
+@app.on_event("startup")
+def load_on_startup():
+    global search_engine
+    print("=== Starting server initialization ===")
+    start = time.time()
+    search_engine = SearchEngine()
+    end = time.time()
+    print(f"=== Initialization complete in {end - start:.2f} seconds ===")
+
 
 class SearchEngine:
     """
@@ -163,13 +167,9 @@ class SearchEngine:
         Returns:
             Formatted answer string with sources
         """
-        with request_lock:  # Use lock for Gemini operations
-            try:
-                # First, check for specific question patterns and return exact expected answers
-                question_lower = question.lower()
-
-                # For all other questions, use Gemini with context
-                prompt = f"""You are a Teaching Assistant for the Tools in Data Science course at IIT Madras.
+        try:
+            # For all other questions, use Gemini with context
+            prompt = f"""You are a Teaching Assistant for the Tools in Data Science course at IIT Madras.
 
 Question: {question}
 
@@ -184,37 +184,35 @@ Instructions:
 
 Provide a clear and direct answer."""
 
-                # Generate with very low temperature for consistency
-                response = self.gemini.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.1,
-                        "top_p": 0.1,
-                        "top_k": 1,
-                        "max_output_tokens": 500
-                    }
-                )
+            # Generate with very low temperature for consistency
+            response = self.gemini.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.1,
+                    "top_p": 0.1,
+                    "top_k": 1,
+                    "max_output_tokens": 500
+                }
+            )
 
-                if response and hasattr(response, 'text'):
-                    answer = response.text.strip()
-                    if not answer.startswith("Answer: "):
-                        answer = "Answer: " + answer
-                    if "Sources:" not in answer:
-                        answer += "\n\nSources:\n" + "\n".join(f"- {r['url']}" for r in search_results[:3])
-                    return answer
+            if response and hasattr(response, 'text'):
+                answer = response.text.strip()
+                if not answer.startswith("Answer: "):
+                    answer = "Answer: " + answer
+                if "Sources:" not in answer:
+                    answer += "\n\nSources:\n" + "\n".join(f"- {r['url']}" for r in search_results[:3])
+                return answer
 
-                return """Answer: I don't know the answer as I couldn't find any relevant information in the course materials.
-
-Sources:"""
-
-            except Exception as e:
-                print(f"Error generating answer: {str(e)}")
-                return """Answer: I don't know the answer as I encountered an error while processing your request.
+            return """Answer: I don't know the answer as I couldn't find any relevant information in the course materials.
 
 Sources:"""
 
-# Initialize search engine
-search_engine = SearchEngine()
+        except Exception as e:
+            print(f"Error generating answer: {str(e)}")
+            return """Answer: I don't know the answer as I encountered an error while processing your request.
+
+Sources:"""
+
 
 @app.post("/api/")
 async def answer_question(request: Request, background_tasks: BackgroundTasks):

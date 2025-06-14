@@ -11,7 +11,7 @@ import requests
 import time
 from datetime import datetime
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dotenv import load_dotenv
 
 # Load environment variables

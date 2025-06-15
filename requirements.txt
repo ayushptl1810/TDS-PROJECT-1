@@ -11,3 +11,4 @@ fastapi
 google-generativeai
 uvicorn
 uvloop
+python-multipart

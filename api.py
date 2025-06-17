@@ -8,13 +8,11 @@ and maintains a vector store of course content and forum posts for context.
 
 import os
 import json
-from typing import List, Dict, Optional, Union, Any
-from fastapi import FastAPI, Request, BackgroundTasks, File, UploadFile
+from typing import List, Dict, Optional
+from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastembed import TextEmbedding
-import faiss
-import numpy as np
+from pinecone import Pinecone
 import pickle
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -23,7 +21,6 @@ import shutil
 import time
 from PIL import Image
 from io import BytesIO
-from functools import lru_cache
 import asyncio
 import base64
 
@@ -32,8 +29,8 @@ load_dotenv()
 
 # Constants
 BASE_URL = "https://discourse.onlinedegree.iitm.ac.in"
-TEXT_DIMENSION = 384  # all-MiniLM-L6-v2 dimension
-CACHE_SIZE = 1000  # Number of search results to cache
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME = "llama-text-embed-v2-index"
 REQUEST_SEMAPHORE = asyncio.Semaphore(1)  # Limit based on environment
 
 # Initialize FastAPI app
@@ -71,14 +68,19 @@ class SearchEngine:
         """Initialize the search engine by loading models and indices."""
         print("Initializing SearchEngine...")
         
-        # Load the sentence transformer model for vector embeddings
-        print("Loading sentence transformer model...")
-        self.text_model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+        # Initialize Pinecone client
+        print("Initializing Pinecone client...")
+        self.pc = Pinecone(api_key=PINECONE_API_KEY)
+        self.index = self.pc.Index(INDEX_NAME)
         
-        # Load FAISS indices for fast similarity search
-        print("Loading FAISS indices...")
-        self.md_index = faiss.read_index("vector_store/md_index.faiss")
-        self.json_index = faiss.read_index("vector_store/json_index.faiss")
+        # Debug: Check index stats
+        try:
+            stats = self.index.describe_index_stats()
+            print(f"Index stats: {stats}")
+            if 'namespaces' in stats:
+                print(f"Available namespaces: {list(stats['namespaces'].keys())}")
+        except Exception as e:
+            print(f"Error getting index stats: {e}")
         
         # Load metadata for mapping indices to content
         print("Loading metadata...")
@@ -92,10 +94,12 @@ class SearchEngine:
         self.md_content = {}
         for meta in self.md_metadata:
             try:
-                with open(meta["file_path"], "r", encoding="utf-8") as f:
+                # Create file path from filename
+                file_path = os.path.join("tds_pages_md", meta["filename"])
+                with open(file_path, "r", encoding="utf-8") as f:
                     self.md_content[meta["filename"]] = f.read()
             except Exception as e:
-                print(f"Error loading file {meta['file_path']}: {str(e)}")
+                print(f"Error loading file {file_path}: {str(e)}")
         
         # Initialize Gemini AI model
         print("Initializing Gemini model...")
@@ -106,59 +110,6 @@ class SearchEngine:
         self.gemini = genai.GenerativeModel('gemini-1.5-flash')
         
         print("SearchEngine initialization complete")
-
-    @lru_cache(maxsize=CACHE_SIZE)
-    def get_text_embedding(self, query: str) -> np.ndarray:
-        """Get text embedding with caching."""
-        try:
-            text_emb = np.array(list(self.text_model.embed([query]))[0], dtype='float32')
-            faiss.normalize_L2(text_emb.reshape(1, -1))
-            text_emb = text_emb.reshape(-1)
-            return text_emb
-        except Exception as e:
-            print(f"Error in get_text_embedding: {str(e)}")
-            raise
-
-    async def get_query_embedding(self, query: str) -> np.ndarray:
-        """Get text embedding for query with caching."""
-        try:
-            text_emb = self.get_text_embedding(query)
-            return text_emb
-        except Exception as e:
-            print(f"Error in get_query_embedding: {str(e)}")
-            raise
-
-    def clean_text(self, text: str) -> str:
-        """Clean and normalize text for better matching."""
-        if not text:
-            return ""
-        # Remove HTML tags
-        text = re.sub(r'<[^>]+>', ' ', text)
-        # Normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove special characters but keep important punctuation
-        text = re.sub(r'[^\w\s.,!?-]', ' ', text)
-        return text.strip()
-
-    def _calculate_semantic_similarity(self, query: str, text: str) -> float:
-        """Calculate semantic similarity between query and text using embeddings."""
-        if not text:
-            return 0.0
-        
-        try:
-            # Get embeddings and convert to numpy arrays
-            query_emb = np.array(list(self.text_model.embed([query]))[0], dtype=np.float32)
-            text_emb = np.array(list(self.text_model.embed([text]))[0], dtype=np.float32)
-            
-            # Normalize embeddings
-            query_emb = query_emb / np.linalg.norm(query_emb)
-            text_emb = text_emb / np.linalg.norm(text_emb)
-            
-            # Calculate cosine similarity
-            return float(np.dot(query_emb, text_emb))
-        except Exception as e:
-            print(f"Error in semantic similarity calculation: {str(e)}")
-            return 0.0
 
     def _normalize_url(self, url: str, post_number: Optional[int] = None) -> str:
         """Normalize URL to use exact format: BASE_URL/t/title-slug/topic_id/post_number"""
@@ -197,24 +148,6 @@ class SearchEngine:
         except Exception as e:
             print(f"Error normalizing URL {url}: {str(e)}")
             return url
-
-    def _urls_match(self, url1: str, url2: str) -> bool:
-        """Check if two URLs match regardless of format."""
-        if not url1 or not url2:
-            return False
-        
-        # Extract topic ID and post number from both URLs
-        def extract_ids(url):
-            match = re.search(r'/t/(?:[^/]+/)?(\d+)(?:/(\d+))?$', url)
-            if match:
-                return (match.group(1), match.group(2))
-            return (None, None)
-        
-        id1, post1 = extract_ids(url1)
-        id2, post2 = extract_ids(url2)
-            
-        # URLs match if they have the same topic ID and post number
-        return id1 == id2 and (post1 == post2 or (not post1 and not post2))
 
     async def process_image_with_gemini(self, image_data: bytes) -> str:
         """Use Gemini to generate a textual description of the image."""
@@ -261,58 +194,76 @@ class SearchEngine:
             else:
                 combined_query = query
             
-            # Get text embedding for the combined query
-            query_embedding = await self.get_query_embedding(combined_query)
-            
             # Extract key terms from query
             query_terms = set(combined_query.lower().split())
             important_terms = {term for term in query_terms if len(term) > 3}
 
-            # Search in both indices sequentially to reduce resource usage on Render
-            async def search_index(index, metadata, content_dict=None, is_forum=False):
-                scores, indices = index.search(
-                    np.array([query_embedding], dtype=np.float32),
-                    min(top_k * 5, index.ntotal)
-                )
-                
-                results = []
-                for score, idx in zip(scores[0], indices[0]):
-                    if idx == -1 or score < 0.1:
-                        continue
+            # Search in both namespaces
+            async def search_namespace(namespace: str, metadata_list: List[Dict], content_dict=None, is_forum=False):
+                try:
+                    # Query Pinecone with the combined query using the correct API format
+                    print(f"Querying Pinecone with: {combined_query[:100]}...")
+                    print(f"Namespace: {namespace}")
                     
-                    meta = metadata[idx]
-                    title = meta.get("title", "").lower()
-                    content = content_dict.get(meta["filename"], "") if content_dict else meta.get("content", "").lower()
-                    url = meta.get("url", "")
+                    # Use the correct Pinecone API format for semantic search
+                    results = self.index.search(
+                        namespace=namespace,
+                        query={
+                            "top_k": min(top_k * 3, 100),
+                            "inputs": {
+                                'text': combined_query
+                            }
+                        }
+                    )
                     
-                    if is_forum:
-                        url = self._normalize_url(url, meta.get("post_number"))
+                    processed_results = []
+                    # Handle the new results structure
+                    if 'result' in results and 'hits' in results['result']:
+                        matches = results['result']['hits']
+                    else:
+                        matches = []
                     
-                    # Calculate scores
-                    title_sim = self._calculate_semantic_similarity(combined_query, title)
-                    content_sim = self._calculate_semantic_similarity(combined_query, content)
-                    phrase_score = self._calculate_phrase_match_score(combined_query, title, content)
-                    context_score = self._calculate_context_score(combined_query, title, content)
-                    
-                    # Calculate term overlap with higher weight for forum posts
-                    title_terms = set(title.split())
-                    content_terms = set(content.split())
-                    term_overlap = len(important_terms.intersection(title_terms)) / len(important_terms) * (0.4 if not is_forum else 0.5) + \
-                                 len(important_terms.intersection(content_terms)) / len(important_terms) * (0.8 if not is_forum else 0.9)
-                    
-                    # Get context for forum posts
-                    context = []
-                    if is_forum and url and meta.get("post_number"):
-                        post_number = meta.get("post_number")
-                        topic_id = meta.get("topic_id")
+                    for match in matches:
+                        # Handle the new match structure
+                        score = match.get('_score', 0)
+                        match_id = match.get('_id', '')
                         
-                        # Get parent post if exists
-                        if post_number > 1:
-                            parent_idx = next((i for i, m in enumerate(metadata) if m.get("post_number") == post_number-1 and m.get("topic_id") == topic_id), None)
-                            if parent_idx is not None:
-                                parent_meta = metadata[parent_idx]
-                                parent_content = parent_meta.get("content", "").lower()
-                                if self._calculate_semantic_similarity(combined_query, parent_content) > 0.05:
+                        if score < 0.1:  # Filter low scores
+                            continue
+                        
+                        # Find corresponding metadata
+                        meta = next((m for m in metadata_list if m["id"] == match_id), None)
+                        if not meta:
+                            continue
+                        
+                        title = meta.get("title", "").lower()
+                        content = content_dict.get(meta["filename"], "") if content_dict else meta.get("content", "").lower()
+                        url = meta.get("url", "")
+                        
+                        if is_forum:
+                            url = self._normalize_url(url, meta.get("post_number"))
+                        
+                        # Calculate additional scores
+                        phrase_score = self._calculate_phrase_match_score(combined_query, title, content)
+                        context_score = self._calculate_context_score(combined_query, title, content)
+                        
+                        # Calculate term overlap
+                        title_terms = set(title.split())
+                        content_terms = set(content.split())
+                        term_overlap = len(important_terms.intersection(title_terms)) / len(important_terms) * (0.4 if not is_forum else 0.5) + \
+                                     len(important_terms.intersection(content_terms)) / len(important_terms) * (0.8 if not is_forum else 0.9)
+                        
+                        # Get context for forum posts
+                        context = []
+                        if is_forum and url and meta.get("post_number"):
+                            post_number = meta.get("post_number")
+                            topic_id = meta.get("topic_id")
+                            
+                            # Get parent post if exists
+                            if post_number > 1:
+                                parent_meta = next((m for m in metadata_list if m.get("post_number") == post_number-1 and m.get("topic_id") == topic_id), None)
+                                if parent_meta:
+                                    parent_content = parent_meta.get("content", "").lower()
                                     parent_url = self._normalize_url(parent_meta.get("url", ""), post_number-1)
                                     context.append({
                                         "content": parent_content,
@@ -320,13 +271,11 @@ class SearchEngine:
                                         "url": parent_url,
                                         "is_parent": True
                                     })
-                        
-                        # Get next post if exists
-                        next_idx = next((i for i, m in enumerate(metadata) if m.get("post_number") == post_number+1 and m.get("topic_id") == topic_id), None)
-                        if next_idx is not None:
-                            next_meta = metadata[next_idx]
-                            next_content = next_meta.get("content", "").lower()
-                            if self._calculate_semantic_similarity(combined_query, next_content) > 0.05:
+                            
+                            # Get next post if exists
+                            next_meta = next((m for m in metadata_list if m.get("post_number") == post_number+1 and m.get("topic_id") == topic_id), None)
+                            if next_meta:
+                                next_content = next_meta.get("content", "").lower()
                                 next_url = self._normalize_url(next_meta.get("url", ""), post_number+1)
                                 context.append({
                                     "content": next_content,
@@ -334,52 +283,59 @@ class SearchEngine:
                                     "url": next_url,
                                     "is_parent": False
                                 })
+                        
+                        # Combine scores with higher weight for forum posts
+                        final_score = (
+                            score * 0.6 +  # Pinecone similarity score
+                            phrase_score * (0.2 if not is_forum else 0.25) +
+                            context_score * 0.05 +
+                            term_overlap * (0.15 if not is_forum else 0.2)
+                        )
+                        
+                        if final_score < min_score:
+                            continue
+                        
+                        result = {
+                            "score": final_score,
+                            "title": meta.get("title", ""),
+                            "url": url,
+                            "content": content[:200] + "..." if len(content) > 200 else content,
+                            "source": "markdown" if content_dict else "forum_post",
+                            "author": meta.get("author", "").lower()
+                        }
+                        
+                        if context:
+                            result["context"] = context
+                        
+                        processed_results.append(result)
                     
-                    # Add context similarity
-                    context_sim = 0.0
-                    if context:
-                        context_text = " ".join([ctx["content"] for ctx in context])
-                        context_sim = self._calculate_semantic_similarity(combined_query, context_text)
+                    return processed_results
                     
-                    # Combine scores with higher weight for forum posts
-                    final_score = (
-                        score * 0.1 +
-                        title_sim * (0.2 if not is_forum else 0.25) +
-                        content_sim * (0.4 if not is_forum else 0.45) +
-                        phrase_score * (0.2 if not is_forum else 0.25) +
-                        context_score * 0.05 +
-                        context_sim * (0.0 if not is_forum else 0.1) +
-                        term_overlap * (0.15 if not is_forum else 0.2)
-                    )
-                    
-                    if final_score < min_score:
-                        continue
-                    
-                    result = {
-                        "score": final_score,
-                        "title": meta.get("title", ""),
-                        "url": url,
-                        "content": content[:200] + "..." if len(content) > 200 else content,
-                        "source": "markdown" if content_dict else "forum_post",
-                        "author": meta.get("author", "").lower()
-                    }
-                    
-                    if context:
-                        result["context"] = context
-                    
-                    results.append(result)
-                
-                return results
+                except Exception as e:
+                    print(f"Error searching namespace {namespace}: {str(e)}")
+                    return []
 
-            # Run searches sequentially to reduce resource usage on Render
-            md_results = await search_index(self.md_index, self.md_metadata, self.md_content, False)
-            json_results = await search_index(self.json_index, self.json_metadata, None, True)
+            # Search both namespaces
+            md_results = await search_namespace("markdown-content", self.md_metadata, self.md_content, False)
+            json_results = await search_namespace("forum-posts", self.json_metadata, None, True)
+            
+            # Debug: Print search results
+            print(f"Markdown results: {len(md_results)}")
+            print(f"Forum results: {len(json_results)}")
+            if md_results:
+                print(f"Top markdown result: {md_results[0].get('title', 'No title')} - Score: {md_results[0].get('score', 0)}")
+            if json_results:
+                print(f"Top forum result: {json_results[0].get('title', 'No title')} - Score: {json_results[0].get('score', 0)}")
             
             # Combine and sort results
             all_results = []
             all_results.extend(md_results)
             all_results.extend(json_results)
             all_results.sort(key=lambda x: x["score"], reverse=True)
+            
+            print(f"Total combined results: {len(all_results)}")
+            if all_results:
+                print(f"Best overall result: {all_results[0].get('title', 'No title')} - Score: {all_results[0].get('score', 0)}")
             
             return all_results[:top_k]
             
@@ -415,7 +371,6 @@ class SearchEngine:
         # Extract key terms and their context
         query_terms = set(query.split())
         title_terms = set(title.split())
-        content_terms = set(content.split())
         
         # Calculate term overlap
         term_overlap = len(query_terms.intersection(title_terms)) / len(query_terms)
@@ -432,19 +387,6 @@ class SearchEngine:
                     proximity_score += len(query_terms.intersection(context_terms)) / len(query_terms)
         
         return (term_overlap * 0.6 + min(1.0, proximity_score) * 0.4)
-
-    def _has_exact_match(self, query: str, text: str) -> bool:
-        """Check if query has an exact match in text."""
-        query_words = query.split()
-        text_words = text.split()
-        
-        # Check for exact phrase matches (2+ words)
-        for i in range(len(text_words) - 1):
-            phrase = " ".join(text_words[i:i+2])
-            if phrase in query:
-                return True
-        
-        return False
 
     async def generate_answer(self, question: str, search_results: List[Dict]) -> Dict:
         """
@@ -499,12 +441,12 @@ Here are the relevant course materials or forum posts (sorted by relevance):
 CRITICAL INSTRUCTIONS:
 1. You MUST use the provided course materials to answer the question
 2. Pay special attention to responses from:
-   - Course Instructors (@rajan.iitm, @dibujohn)
-   - Teaching Assistants (@21f3001136, @sandeepstele)
+   - Course Instructors (@iamprasna, @carlton)
+   - Teaching Assistants (@Jivraj @HritikRoshan_HRM)
 3. For specific topics, prioritize:
    - Assignment/Project queries: TA responses
-   - Quiz queries: @rajan.iitm's responses
-   - ROE/Exam queries: @dibujohn's responses
+   - Quiz queries: @iamprasna's responses
+   - ROE/Exam queries: @carlton's responses
 4. Consider the FULL context of forum posts, including parent posts and replies
 5. If a post is part of a conversation, consider the entire thread for context
 6. Consider ALL provided sources, not just the highest scoring one
@@ -513,8 +455,8 @@ CRITICAL INSTRUCTIONS:
 9. For handling contradictory statements:
    - ALWAYS prioritize official course materials over forum posts
    - If forum posts contradict each other, prioritize in this order:
-     1. Course Instructor responses (@rajan.iitm, @dibujohn)
-     2. Teaching Assistant responses (@21f3001136, @sandeepstele)
+     1. Course Instructor responses (@iamprasna, @carlton)
+     2. Teaching Assistant responses (@Jivraj @HritikRoshan_HRM)
      3. Student responses (only if no instructor/TA response exists)
    - If an instructor/TA later corrects or updates information, use their latest response
    - If there are multiple instructor/TA responses, use the most recent one
@@ -669,7 +611,6 @@ def get_disk_usage():
 @app.post("/api")
 async def answer_question(
     request: Request,
-    background_tasks: BackgroundTasks,
     image: Optional[UploadFile] = File(None)
 ):
     """
@@ -762,7 +703,7 @@ async def answer_question(
                 start_time = time.time()
                 
                 # Search and generate answer concurrently
-                search_task = search_engine.search(question, image_data, top_k=3, min_score=0.3)
+                search_task = search_engine.search(question, image_data, top_k=3, min_score=0.15)
                 search_results = await search_task
                 search_time = time.time() - start_time
                 
@@ -809,11 +750,10 @@ async def answer_question(
 @app.post("/api/")
 async def answer_question_with_slash(
     request: Request,
-    background_tasks: BackgroundTasks,
     image: Optional[UploadFile] = File(None)
 ):
     """Handle requests to /api/ (with trailing slash) to prevent redirects."""
-    return await answer_question(request, background_tasks, image)
+    return await answer_question(request, image)
 
 if __name__ == "__main__":
     import uvicorn

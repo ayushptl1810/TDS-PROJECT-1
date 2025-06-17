@@ -3,12 +3,11 @@ playwright
 beautifulsoup4
 requests
 python-dotenv
-onnxruntime 
 numpy 
-fastembed 
-faiss-cpu
+pinecone
 fastapi
 google-generativeai
 uvicorn
 uvloop
 python-multipart
+Pillow

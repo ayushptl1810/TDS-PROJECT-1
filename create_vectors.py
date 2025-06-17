@@ -2,15 +2,14 @@
 Vector Store Creation Script
 
 This script creates vector embeddings for course content and forum posts,
-storing them in FAISS indices for efficient similarity search.
+storing them in Pinecone vector database for efficient similarity search.
 """
 
 import os
 import json
 import pickle
-from fastembed import TextEmbedding, ImageEmbedding
+from pinecone import Pinecone
 import requests
-import faiss
 import numpy as np
 from tqdm import tqdm
 from bs4 import BeautifulSoup
@@ -18,10 +17,13 @@ from PIL import Image
 from io import BytesIO
 import re
 from datetime import datetime
+from dotenv import load_dotenv
 
-# Constants for embedding dimensions
-TEXT_DIMENSION = 384  # all-MiniLM-L6-v2 dimension
-IMAGE_DIMENSION = 512  # CLIP dimension
+load_dotenv()
+
+# Pinecone configuration
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME = "llama-text-embed-v2-index"
 
 def extract_image_urls(html_content):
     soup = BeautifulSoup(html_content, "html.parser")
@@ -108,23 +110,96 @@ def extract_post_metadata(html_content: str, post_data: dict) -> dict:
     
     return metadata
 
-def create_md_vectors():
+def delete_pinecone_index():
+    """
+    Delete the Pinecone index if it exists.
+    """
+    print("Deleting existing Pinecone index...")
+    
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    try:
+        pc.delete_index(INDEX_NAME)
+        print(f"Index '{INDEX_NAME}' deleted successfully")
+        
+        # Wait for deletion to complete
+        import time
+        while True:
+            try:
+                pc.Index(INDEX_NAME)
+                print("Waiting for deletion to complete...")
+                time.sleep(5)
+            except Exception:
+                print("Index deletion completed")
+                break
+    except Exception as e:
+        if "not found" in str(e).lower() or "404" in str(e):
+            print(f"Index '{INDEX_NAME}' doesn't exist")
+        else:
+            print(f"Error deleting index: {str(e)}")
+
+def create_pinecone_index():
+    """
+    Create the Pinecone index if it doesn't exist.
+    Note: The index must be created manually through the Pinecone console with integrated inference enabled.
+    """
+    print("Checking Pinecone index...")
+    
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    # Check if index exists
+    try:
+        index = pc.Index(INDEX_NAME)
+        print(f"Index '{INDEX_NAME}' already exists")
+        
+        # Test if integrated inference is working
+        try:
+            test_record = {"id": "test", "text": "test"}
+            index.upsert_records(namespace="test", records=[test_record])
+            print("Integrated inference is working correctly")
+            return index
+        except Exception as e:
+            if "integrated inference is not configured" in str(e).lower():
+                print("ERROR: Index exists but doesn't have integrated inference configured.")
+                print("Please create the index manually through the Pinecone console:")
+                print("1. Go to https://app.pinecone.io/")
+                print("2. Create a new index named 'llama-text-embed-v2-index'")
+                print("3. Set dimension to 1024")
+                print("4. Set metric to 'cosine'")
+                print("5. Enable 'Integrated inference' and select 'llama-text-embed-v2' model")
+                print("6. Choose serverless with AWS us-east-1")
+                raise Exception("Index needs to be created manually with integrated inference")
+            else:
+                raise e
+        
+    except Exception as e:
+        if "not found" in str(e).lower() or "404" in str(e):
+            print("ERROR: Index 'llama-text-embed-v2-index' not found.")
+            print("Please create the index manually through the Pinecone console:")
+            print("1. Go to https://app.pinecone.io/")
+            print("2. Create a new index named 'llama-text-embed-v2-index'")
+            print("3. Set dimension to 1024")
+            print("4. Set metric to 'cosine'")
+            print("5. Enable 'Integrated inference' and select 'llama-text-embed-v2' model")
+            print("6. Choose serverless with AWS us-east-1")
+            raise Exception("Index needs to be created manually with integrated inference")
+        else:
+            raise e
+
+def create_md_vectors(index):
     """
     Create vector embeddings for markdown files in the tds_pages_md directory.
-    Saves both the FAISS index and metadata for later use.
+    Stores them in Pinecone vector database for efficient similarity search.
     """
     print("Loading markdown files...")
-    
-    # Initialize the sentence transformer model
-    model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
     
     # Get list of markdown files
     md_dir = "tds_pages_md"
     md_files = [f for f in os.listdir(md_dir) if f.endswith(".md")]
     
-    # Prepare data structures
-    texts = []
-    metadata = []
+    # Prepare data for Pinecone upsert
+    records = []
+    metadata_list = []
     
     # Process each markdown file
     for filename in tqdm(md_files, desc="Processing markdown files"):
@@ -158,10 +233,10 @@ def create_md_vectors():
                 content_keywords = set(re.findall(r'\b\w+\b', content.lower()))
                 keywords = title_keywords.union(content_keywords)
                 
-                # Create structured search text
-                search_text = f"""Title: {title}
-Content: {content}
-Keywords: {', '.join(keywords)}"""
+                # Create structured search text (truncated to reduce size)
+                search_text = f"""Title: {title[:100]}
+Content: {content[:1000]}
+Keywords: {', '.join(list(keywords)[:5])}"""
                 
                 # Only construct URL if not found in frontmatter
                 if not original_url:
@@ -171,47 +246,89 @@ Keywords: {', '.join(keywords)}"""
                     url_path = url_path.replace("__", "-").replace("_", "-")
                     original_url = f"https://tds.s-anand.net/#/{url_path}"
                 
-                texts.append(search_text)
-                metadata.append({
+                # Create unique ID for the record
+                record_id = f"md_{filename.replace('.md', '')}"
+                
+                # Prepare record for Pinecone
+                record = {
+                    "id": record_id,
+                    "text": search_text
+                }
+                
+                records.append(record)
+                
+                # Store minimal metadata to stay under 40KB limit
+                metadata_list.append({
+                    "id": record_id,
                     "filename": filename,
-                    "file_path": file_path,
-                    "title": title,
-                    "content": content,
+                    "title": title[:100],  # Truncate title further
                     "url": original_url,
-                    "search_text": search_text,
-                    "keywords": list(keywords)
+                    "type": "markdown"
                 })
+                
         except Exception as e:
             print(f"Error processing {filename}: {str(e)}")
     
-    print(f"Creating embeddings for {len(texts)} markdown files...")
+    print(f"Creating embeddings for {len(records)} markdown files...")
     
-    # Create embeddings
-    embeddings = np.array(list(model.embed(texts)), dtype='float32')
+    # Upsert records to Pinecone in batches
+    batch_size = 20  # Reduce batch size further for better reliability
+    successful_uploads = 0
+    failed_uploads = 0
     
-    # Normalize embeddings for cosine similarity
-    faiss.normalize_L2(embeddings)
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                index.upsert_records(
+                    namespace="markdown-content",
+                    records=batch
+                )
+                successful_uploads += len(batch)
+                print(f"Upserted batch {i//batch_size + 1}/{(len(records) + batch_size - 1)//batch_size} ({len(batch)} records)")
+                break
+            except Exception as e:
+                retry_count += 1
+                print(f"Error upserting batch {i//batch_size + 1} (attempt {retry_count}): {str(e)}")
+                if retry_count >= max_retries:
+                    # Try uploading records individually
+                    print(f"Trying individual upload for batch {i//batch_size + 1}")
+                    individual_success = 0
+                    for j, record in enumerate(batch):
+                        try:
+                            index.upsert_records(
+                                namespace="markdown-content",
+                                records=[record]
+                            )
+                            individual_success += 1
+                            successful_uploads += 1
+                        except Exception as individual_error:
+                            print(f"Failed to upload individual record {i+j+1}: {str(individual_error)}")
+                            failed_uploads += 1
+                    print(f"Individual upload result: {individual_success}/{len(batch)} successful")
+                else:
+                    import time
+                    time.sleep(2)  # Wait before retry
     
-    # Create FAISS index with cosine similarity (IP = Inner Product)
-    index = faiss.IndexFlatIP(TEXT_DIMENSION)
-    index.add(embeddings)
+    print(f"Upload summary: {successful_uploads} successful, {failed_uploads} failed out of {len(records)} total")
     
-    # Save index and metadata
-    print("Saving markdown index and metadata...")
-    faiss.write_index(index, "vector_store/md_index.faiss")
+    # Save metadata locally for reference
+    print("Saving markdown metadata...")
+    os.makedirs("vector_store", exist_ok=True)
     with open("vector_store/md_metadata.pkl", "wb") as f:
-        pickle.dump(metadata, f)
+        pickle.dump(metadata_list, f)
+    
+    print(f"Successfully processed {len(records)} markdown files")
 
-def create_json_vectors():
+def create_json_vectors(index):
     """
     Create vector embeddings for forum posts from JSON files.
-    Uses text embeddings for search and optionally combines with image embeddings.
+    Stores them in Pinecone vector database for efficient similarity search.
     """
     print("Loading forum posts...")
-
-    # Initialize both models
-    text_model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
-    image_model = ImageEmbedding('Qdrant/clip-ViT-B-32-vision')
 
     # Load and validate JSON data
     try:
@@ -239,7 +356,7 @@ def create_json_vectors():
         print(f"Error loading JSON file: {str(e)}")
         return
 
-    embeddings = []
+    records = []
     metadata_list = []
     processed_count = 0
     error_count = 0
@@ -265,29 +382,34 @@ def create_json_vectors():
                 "content": content,
                 "url": post.get("url", ""),
                 "author": post.get("author", ""),
-                "topic_title": post.get("title", ""),  # Using title as topic_title since it's the same
                 "topic_id": post.get("topic_id", ""),
                 "post_number": post.get("post_number", 0),
-                "created_at": post.get("created_at", ""),
                 "role": "user"  # Default role
             }
             
             # Create structured search text
             search_text = f"""Title: {title}
 Content: {content}
-Author: {post_metadata['author']} ({post_metadata['role']})
-Date: {post_metadata['created_at']}"""
+Author: {post_metadata['author']} ({post_metadata['role']})"""
             
-            # Get text embedding
-            text_emb = np.array(list(text_model.embed([search_text]))[0], dtype=np.float32)
-            faiss.normalize_L2(text_emb.reshape(1, -1))
-            text_emb = text_emb.reshape(-1)
+            # Create unique ID for the record
+            record_id = f"post_{post_metadata['topic_id']}_{post_metadata['post_number']}"
             
-            # For now, we'll just use text embeddings
-            final_emb = text_emb
+            # Prepare record for Pinecone
+            record = {
+                "id": record_id,
+                "text": search_text
+            }
             
-            embeddings.append(final_emb)
-            metadata_list.append(post_metadata)
+            records.append(record)
+            
+            # Store metadata separately
+            metadata_list.append({
+                "id": record_id,
+                **post_metadata,
+                "type": "forum_post"
+            })
+            
             processed_count += 1
             
         except Exception as e:
@@ -295,34 +417,74 @@ Date: {post_metadata['created_at']}"""
             error_count += 1
             continue
 
-    # Create FAISS index
-    if embeddings:
-        print(f"\nCreating FAISS index with {len(embeddings)} embeddings...")
-        embeddings_array = np.array(embeddings, dtype='float32')
-        faiss.normalize_L2(embeddings_array)  # Normalize for cosine similarity
-        index = faiss.IndexFlatIP(embeddings_array.shape[1])  # Use Inner Product for cosine similarity
-        index.add(embeddings_array)
+    # Upsert records to Pinecone
+    if records:
+        print(f"\nUpserting {len(records)} records to Pinecone...")
         
-        # Save index and metadata
+        # Upsert records in batches
+        batch_size = 90
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            try:
+                index.upsert_records(
+                    namespace="forum-posts",
+                    records=batch
+                )
+                print(f"Upserted batch {i//batch_size + 1}/{(len(records) + batch_size - 1)//batch_size}")
+            except Exception as e:
+                print(f"Error upserting batch {i//batch_size + 1}: {str(e)}")
+        
+        # Save metadata locally for reference
         os.makedirs("vector_store", exist_ok=True)
-        print("Saving index and metadata...")
-        faiss.write_index(index, "vector_store/json_index.faiss")
+        print("Saving forum posts metadata...")
         with open("vector_store/json_metadata.pkl", "wb") as f:
             pickle.dump(metadata_list, f)
         
         print(f"\nVector store creation complete!")
         print(f"Successfully processed: {processed_count} posts")
         print(f"Errors encountered: {error_count} posts")
-        print(f"Total embeddings created: {len(embeddings)}")
+        print(f"Total records created: {len(records)}")
     else:
-        print("No embeddings created - no valid posts found")
+        print("No records created - no valid posts found")
+
+def check_and_fix_markdown_vectors(index):
+    """
+    Check what markdown files are in the Pinecone index and re-upload missing ones.
+    """
+    print("Checking markdown vectors in Pinecone index...")
+    
+    # Get index stats
+    stats = index.describe_index_stats()
+    if 'namespaces' in stats and 'markdown-content' in stats['namespaces']:
+        current_count = stats['namespaces']['markdown-content']['vector_count']
+        print(f"Current markdown vectors in index: {current_count}")
+    else:
+        current_count = 0
+        print("No markdown-content namespace found")
+    
+    # Check how many markdown files we should have
+    md_dir = "tds_pages_md"
+    md_files = [f for f in os.listdir(md_dir) if f.endswith(".md")]
+    expected_count = len(md_files)
+    print(f"Expected markdown files: {expected_count}")
+    
+    if current_count < expected_count:
+        print(f"Missing {expected_count - current_count} markdown files. Re-uploading...")
+        create_md_vectors(index)
+    else:
+        print("All markdown files are uploaded successfully!")
 
 if __name__ == "__main__":
-    # Create vector store directory if it doesn't exist
+    # Create vector store directory if it doesn't exist (for metadata storage)
     os.makedirs("vector_store", exist_ok=True)
     
-    # Create vectors for both markdown and forum content
-    create_json_vectors()
-    create_md_vectors()
+    # Create or get the Pinecone index
+    index = create_pinecone_index()
     
-    print("Vector store creation complete!") 
+    # Check and fix markdown vectors
+    check_and_fix_markdown_vectors(index)
+    
+    # Create vectors for forum posts
+    create_json_vectors(index)
+    
+    print("Pinecone vector store creation complete!") 

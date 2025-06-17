@@ -35,7 +35,8 @@ load_dotenv()
 BASE_URL = "https://discourse.onlinedegree.iitm.ac.in"
 TEXT_DIMENSION = 384  # all-MiniLM-L6-v2 dimension
 CACHE_SIZE = 1000  # Number of search results to cache
-SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=4)  # For parallel search operations
+SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)  # Reduced for Render's resource limitations
+REQUEST_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent requests to 3
 
 # Initialize FastAPI app
 app = FastAPI(title="TDS Virtual TA API")
@@ -276,7 +277,7 @@ class SearchEngine:
             query_terms = set(combined_query.lower().split())
             important_terms = {term for term in query_terms if len(term) > 3}
 
-            # Search in both indices concurrently
+            # Search in both indices sequentially to reduce resource usage on Render
             async def search_index(index, metadata, content_dict=None, is_forum=False):
                 scores, indices = await asyncio.get_event_loop().run_in_executor(
                     SEARCH_EXECUTOR,
@@ -381,11 +382,9 @@ class SearchEngine:
                 
                 return results
 
-            # Run searches concurrently
-            md_task = search_index(self.md_index, self.md_metadata, self.md_content, False)
-            json_task = search_index(self.json_index, self.json_metadata, None, True)
-            
-            md_results, json_results = await asyncio.gather(md_task, json_task)
+            # Run searches sequentially to reduce resource usage on Render
+            md_results = await search_index(self.md_index, self.md_metadata, self.md_content, False)
+            json_results = await search_index(self.json_index, self.json_metadata, None, True)
             
             # Combine and sort results
             all_results = []
@@ -668,6 +667,10 @@ Sources:
                 "links": []
             }
 
+@app.get("/")
+async def root():
+    return {"message": "TDS Virtual TA API is running", "endpoints": ["/api", "/disk-usage"]}
+
 @app.get("/disk-usage")
 def get_disk_usage():
     total, used, free = shutil.disk_usage("/")
@@ -768,32 +771,42 @@ async def answer_question(
         
         # Process the request
         try:
-            # Search and generate answer concurrently
-            search_task = search_engine.search(question, image_data, top_k=3, min_score=0.2)
-            search_results = await search_task
-            
-            if not search_results:
-                return JSONResponse(content={
-                    "answer": "I don't know the answer as I couldn't find any relevant information in the course materials.",
-                    "links": []
-                })
-            
-            response = await search_engine.generate_answer(question or "What is in this image?", search_results)
-            
-            # Format response
-            formatted_response = {
-                "answer": response["answer"].strip(),
-                "links": [
-                    {
-                            "url": str(link.get("url", "")).strip(),
-                            "text": str(link.get("text", "Source")).strip()
+            # Limit concurrent requests to prevent resource exhaustion
+            async with REQUEST_SEMAPHORE:
+                start_time = time.time()
+                
+                # Search and generate answer concurrently
+                search_task = search_engine.search(question, image_data, top_k=3, min_score=0.3)
+                search_results = await search_task
+                search_time = time.time() - start_time
+                
+                if not search_results:
+                    return JSONResponse(content={
+                        "answer": "I don't know the answer as I couldn't find any relevant information in the course materials.",
+                        "links": []
+                    })
+                
+                answer_start = time.time()
+                response = await search_engine.generate_answer(question or "What is in this image?", search_results)
+                answer_time = time.time() - answer_start
+                total_time = time.time() - start_time
+                
+                print(f"Request timing - Search: {search_time:.2f}s, Answer: {answer_time:.2f}s, Total: {total_time:.2f}s")
+                
+                # Format response
+                formatted_response = {
+                    "answer": response["answer"].strip(),
+                    "links": [
+                        {
+                                "url": str(link.get("url", "")).strip(),
+                                "text": str(link.get("text", "Source")).strip()
+                        }
+                        for link in response["links"]
+                            if link.get("url")
+                        ]
                     }
-                    for link in response["links"]
-                        if link.get("url")
-                    ]
-                }
-            
-            return JSONResponse(content=formatted_response)
+                
+                return JSONResponse(content=formatted_response)
             
         except Exception as e:
             raise
@@ -806,6 +819,15 @@ async def answer_question(
                 "links": []
             }
         )
+
+@app.post("/api/")
+async def answer_question_with_slash(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    image: Optional[UploadFile] = File(None)
+):
+    """Handle requests to /api/ (with trailing slash) to prevent redirects."""
+    return await answer_question(request, background_tasks, image)
 
 if __name__ == "__main__":
     import uvicorn

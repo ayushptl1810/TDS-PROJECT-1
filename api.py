@@ -677,7 +677,7 @@ def get_disk_usage():
         "free_gb": round(free / (1024**3), 2),
     })
 
-@app.post("/api/")
+@app.post("/api")
 async def answer_question(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -713,7 +713,7 @@ async def answer_question(
                 # If not JSON, try to extract from raw body
                 body = (await request.body()).decode('utf-8')
                 if "{{prompt}}" in body:
-                    # This is a promptfoo template string
+                # This is a promptfoo template string
                     question = body.replace("{{prompt}}", "").strip()
                 else:
                     # Try to extract question using patterns
@@ -785,13 +785,13 @@ async def answer_question(
                 "answer": response["answer"].strip(),
                 "links": [
                     {
-                        "url": str(link.get("url", "")).strip(),
-                        "text": str(link.get("text", "Source")).strip()
+                            "url": str(link.get("url", "")).strip(),
+                            "text": str(link.get("text", "Source")).strip()
                     }
                     for link in response["links"]
-                    if link.get("url")
-                ]
-            }
+                        if link.get("url")
+                    ]
+                }
             
             return JSONResponse(content=formatted_response)
             

@@ -25,7 +25,6 @@ from PIL import Image
 from io import BytesIO
 from functools import lru_cache
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import base64
 
 # Load environment variables
@@ -35,8 +34,7 @@ load_dotenv()
 BASE_URL = "https://discourse.onlinedegree.iitm.ac.in"
 TEXT_DIMENSION = 384  # all-MiniLM-L6-v2 dimension
 CACHE_SIZE = 1000  # Number of search results to cache
-SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)  # Reduced for Render's resource limitations
-REQUEST_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent requests to 3
+REQUEST_SEMAPHORE = asyncio.Semaphore(1)  # Limit based on environment
 
 # Initialize FastAPI app
 app = FastAPI(title="TDS Virtual TA API")
@@ -124,11 +122,7 @@ class SearchEngine:
     async def get_query_embedding(self, query: str) -> np.ndarray:
         """Get text embedding for query with caching."""
         try:
-            text_emb = await asyncio.get_event_loop().run_in_executor(
-                SEARCH_EXECUTOR,
-                self.get_text_embedding,
-                query
-            )
+            text_emb = self.get_text_embedding(query)
             return text_emb
         except Exception as e:
             print(f"Error in get_query_embedding: {str(e)}")
@@ -241,10 +235,7 @@ class SearchEngine:
             """
             
             # Generate description using Gemini
-            response = await asyncio.get_event_loop().run_in_executor(
-                SEARCH_EXECUTOR,
-                lambda: self.gemini.generate_content([prompt, image])
-            )
+            response = self.gemini.generate_content([prompt, image])
             
             if response and hasattr(response, 'text'):
                 description = response.text.strip()
@@ -279,9 +270,7 @@ class SearchEngine:
 
             # Search in both indices sequentially to reduce resource usage on Render
             async def search_index(index, metadata, content_dict=None, is_forum=False):
-                scores, indices = await asyncio.get_event_loop().run_in_executor(
-                    SEARCH_EXECUTOR,
-                    index.search,
+                scores, indices = index.search(
                     np.array([query_embedding], dtype=np.float32),
                     min(top_k * 5, index.ntotal)
                 )
@@ -558,17 +547,14 @@ Sources:
 [Include ALL relevant sources, not just the highest scoring one]"""
 
             # Generate with very low temperature for consistency
-            response = await asyncio.get_event_loop().run_in_executor(
-                SEARCH_EXECUTOR,
-                lambda: self.gemini.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.1,
-                    "top_p": 0.1,
-                    "top_k": 1,
-                        "max_output_tokens": 1000
-                }
-                )
+            response = self.gemini.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.1,
+                "top_p": 0.1,
+                "top_k": 1,
+                    "max_output_tokens": 1000
+            }
             )
 
             if response and hasattr(response, 'text'):

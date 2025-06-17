@@ -12,7 +12,7 @@ from typing import List, Dict, Optional, Union, Any
 from fastapi import FastAPI, Request, BackgroundTasks, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastembed import TextEmbedding, ImageEmbedding
+from fastembed import TextEmbedding
 import faiss
 import numpy as np
 import pickle
@@ -26,6 +26,7 @@ from io import BytesIO
 from functools import lru_cache
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import base64
 
 # Load environment variables
 load_dotenv()
@@ -33,7 +34,6 @@ load_dotenv()
 # Constants
 BASE_URL = "https://discourse.onlinedegree.iitm.ac.in"
 TEXT_DIMENSION = 384  # all-MiniLM-L6-v2 dimension
-IMAGE_DIMENSION = 512  # CLIP dimension
 CACHE_SIZE = 1000  # Number of search results to cache
 SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=4)  # For parallel search operations
 
@@ -76,10 +76,6 @@ class SearchEngine:
         print("Loading sentence transformer model...")
         self.text_model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
         
-        # Load CLIP model for image embeddings
-        print("Loading CLIP model...")
-        self.image_model = ImageEmbedding('Qdrant/clip-ViT-B-32-vision')
-        
         # Load FAISS indices for fast similarity search
         print("Loading FAISS indices...")
         self.md_index = faiss.read_index("vector_store/md_index.faiss")
@@ -112,57 +108,27 @@ class SearchEngine:
         
         print("SearchEngine initialization complete")
 
-    def preprocess_image(self, image: Union[Image.Image, bytes]) -> Image.Image:
-        """Preprocess image for CLIP model."""
-        if isinstance(image, bytes):
-            image = Image.open(BytesIO(image)).convert('RGB')
-        return image.resize((224, 224))
-
     @lru_cache(maxsize=CACHE_SIZE)
-    def get_query_embedding(self, query: Optional[str] = None, image_hash: Optional[str] = None) -> np.ndarray:
-        """Get embedding for query (text and/or image) with caching."""
+    def get_text_embedding(self, query: str) -> np.ndarray:
+        """Get text embedding with caching."""
         try:
-            if query and image_hash:
-                # Get both embeddings
-                text_emb = np.array(list(self.text_model.embed([query]))[0], dtype='float32')
-                img_emb = np.array(list(self.image_model.embed([image_hash]))[0], dtype='float32')
-                
-                # Normalize embeddings
-                faiss.normalize_L2(text_emb.reshape(1, -1))
-                faiss.normalize_L2(img_emb.reshape(1, -1))
-                text_emb = text_emb.reshape(-1)
-                img_emb = img_emb.reshape(-1)
-                
-                return {
-                    'text_emb': text_emb,
-                    'image_emb': img_emb,
-                    'has_text': True,
-                    'has_image': True
-                }
-            elif query:
-                # Text-only query
-                text_emb = np.array(list(self.text_model.embed([query]))[0], dtype='float32')
-                faiss.normalize_L2(text_emb.reshape(1, -1))
-                text_emb = text_emb.reshape(-1)
-                return {
-                    'text_emb': text_emb,
-                    'image_emb': None,
-                    'has_text': True,
-                    'has_image': False
-                }
-            elif image_hash:
-                # Image-only query
-                img_emb = np.array(list(self.image_model.embed([image_hash]))[0], dtype='float32')
-                faiss.normalize_L2(img_emb.reshape(1, -1))
-                img_emb = img_emb.reshape(-1)
-                return {
-                    'text_emb': None,
-                    'image_emb': img_emb,
-                    'has_text': False,
-                    'has_image': True
-                }
-            else:
-                raise ValueError("Either query text or image must be provided")
+            text_emb = np.array(list(self.text_model.embed([query]))[0], dtype='float32')
+            faiss.normalize_L2(text_emb.reshape(1, -1))
+            text_emb = text_emb.reshape(-1)
+            return text_emb
+        except Exception as e:
+            print(f"Error in get_text_embedding: {str(e)}")
+            raise
+
+    async def get_query_embedding(self, query: str) -> np.ndarray:
+        """Get text embedding for query with caching."""
+        try:
+            text_emb = await asyncio.get_event_loop().run_in_executor(
+                SEARCH_EXECUTOR,
+                self.get_text_embedding,
+                query
+            )
+            return text_emb
         except Exception as e:
             print(f"Error in get_query_embedding: {str(e)}")
             raise
@@ -255,24 +221,59 @@ class SearchEngine:
         # URLs match if they have the same topic ID and post number
         return id1 == id2 and (post1 == post2 or (not post1 and not post2))
 
-    async def search(self, query: str, image_data: Optional[bytes] = None, top_k: int = 5, min_score: float = 0.15) -> List[Dict]:
-        """Search for relevant content using both text and image data."""
+    async def process_image_with_gemini(self, image_data: bytes) -> str:
+        """Use Gemini to generate a textual description of the image."""
         try:
-            # Get query embedding
-            image_hash = None
-            if image_data:
-                # Create a simple hash of image data for caching
-                image_hash = str(hash(image_data))
+            # Convert bytes to PIL Image
+            image = Image.open(BytesIO(image_data))
             
-            query_embedding = await asyncio.get_event_loop().run_in_executor(
+            # Create prompt for image description
+            prompt = """
+            Please describe this image in detail, focusing on:
+            - What you see in the image
+            - Any text, diagrams, or visual elements
+            - The context or subject matter
+            - Any relevant technical or educational content
+            
+            Provide a clear, descriptive text that could be used to search for related information.
+            Keep the description concise but comprehensive.
+            """
+            
+            # Generate description using Gemini
+            response = await asyncio.get_event_loop().run_in_executor(
                 SEARCH_EXECUTOR,
-                self.get_query_embedding,
-                query,
-                image_hash
+                lambda: self.gemini.generate_content([prompt, image])
             )
             
+            if response and hasattr(response, 'text'):
+                description = response.text.strip()
+                return description
+            else:
+                return "Unable to process image"
+                
+        except Exception as e:
+            return "Error processing image"
+
+    async def search(self, query: str, image_data: Optional[bytes] = None, top_k: int = 5, min_score: float = 0.15) -> List[Dict]:
+        """Search for relevant content using text and/or image data."""
+        try:
+            # If image is provided, get description from Gemini
+            if image_data:
+                image_description = await self.process_image_with_gemini(image_data)
+                
+                # Combine question with image description
+                if query:
+                    combined_query = f"{query} Image shows: {image_description}"
+                else:
+                    combined_query = f"Image shows: {image_description}"
+            else:
+                combined_query = query
+            
+            # Get text embedding for the combined query
+            query_embedding = await self.get_query_embedding(combined_query)
+            
             # Extract key terms from query
-            query_terms = set(query.lower().split())
+            query_terms = set(combined_query.lower().split())
             important_terms = {term for term in query_terms if len(term) > 3}
 
             # Search in both indices concurrently
@@ -280,7 +281,7 @@ class SearchEngine:
                 scores, indices = await asyncio.get_event_loop().run_in_executor(
                     SEARCH_EXECUTOR,
                     index.search,
-                    np.array([query_embedding['text_emb']], dtype=np.float32),
+                    np.array([query_embedding], dtype=np.float32),
                     min(top_k * 5, index.ntotal)
                 )
                 
@@ -298,10 +299,10 @@ class SearchEngine:
                         url = self._normalize_url(url, meta.get("post_number"))
                     
                     # Calculate scores
-                    title_sim = self._calculate_semantic_similarity(query, title)
-                    content_sim = self._calculate_semantic_similarity(query, content)
-                    phrase_score = self._calculate_phrase_match_score(query, title, content)
-                    context_score = self._calculate_context_score(query, title, content)
+                    title_sim = self._calculate_semantic_similarity(combined_query, title)
+                    content_sim = self._calculate_semantic_similarity(combined_query, content)
+                    phrase_score = self._calculate_phrase_match_score(combined_query, title, content)
+                    context_score = self._calculate_context_score(combined_query, title, content)
                     
                     # Calculate term overlap with higher weight for forum posts
                     title_terms = set(title.split())
@@ -321,7 +322,7 @@ class SearchEngine:
                             if parent_idx is not None:
                                 parent_meta = metadata[parent_idx]
                                 parent_content = parent_meta.get("content", "").lower()
-                                if self._calculate_semantic_similarity(query, parent_content) > 0.05:
+                                if self._calculate_semantic_similarity(combined_query, parent_content) > 0.05:
                                     parent_url = self._normalize_url(parent_meta.get("url", ""), post_number-1)
                                     context.append({
                                         "content": parent_content,
@@ -335,7 +336,7 @@ class SearchEngine:
                         if next_idx is not None:
                             next_meta = metadata[next_idx]
                             next_content = next_meta.get("content", "").lower()
-                            if self._calculate_semantic_similarity(query, next_content) > 0.05:
+                            if self._calculate_semantic_similarity(combined_query, next_content) > 0.05:
                                 next_url = self._normalize_url(next_meta.get("url", ""), post_number+1)
                                 context.append({
                                     "content": next_content,
@@ -348,7 +349,7 @@ class SearchEngine:
                     context_sim = 0.0
                     if context:
                         context_text = " ".join([ctx["content"] for ctx in context])
-                        context_sim = self._calculate_semantic_similarity(query, context_text)
+                        context_sim = self._calculate_semantic_similarity(combined_query, context_text)
                     
                     # Combine scores with higher weight for forum posts
                     final_score = (
@@ -478,12 +479,7 @@ class SearchEngine:
             }
         """
         try:
-            print(f"\n=== DEBUG: Generate Answer ===")
-            print(f"Question: {question}")
-            print(f"Number of search results: {len(search_results)}")
-            
             if not search_results:
-                print("No search results found")
                 return {
                     "answer": "I don't know the answer as I couldn't find any relevant information in the course materials.",
                     "links": []
@@ -562,25 +558,22 @@ Sources:
 2. URL: [exact_url_2], Text: [brief quote or description with specific values]
 [Include ALL relevant sources, not just the highest scoring one]"""
 
-            print("\nSending prompt to Gemini...")
-
             # Generate with very low temperature for consistency
             response = await asyncio.get_event_loop().run_in_executor(
                 SEARCH_EXECUTOR,
                 lambda: self.gemini.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.1,
-                        "top_p": 0.1,
-                        "top_k": 1,
+                prompt,
+                generation_config={
+                    "temperature": 0.1,
+                    "top_p": 0.1,
+                    "top_k": 1,
                         "max_output_tokens": 1000
-                    }
+                }
                 )
             )
 
             if response and hasattr(response, 'text'):
                 answer_text = response.text.strip()
-                print(f"\nGemini Response:\n{answer_text}")
                 
                 # Extract answer and sources
                 answer_match = re.search(r'Answer:\s*(.*?)(?=\nSources:|$)', answer_text, re.DOTALL)
@@ -670,7 +663,6 @@ Sources:
             }
 
         except Exception as e:
-            print(f"Error generating answer: {str(e)}")
             return {
                 "answer": "I don't know the answer as I encountered an error while processing your request.",
                 "links": []
@@ -696,42 +688,74 @@ async def answer_question(
     Supports both text and image queries.
     """
     try:
-        # Get request body
-        body = await request.body()
-        body_str = body.decode('utf-8')
+        # Get form data first
+        form_data = await request.form()
         
-        # Extract question - handle both JSON and string formats
+        # Extract question from form data or JSON body
         question = None
+        image_path = None
         
-        # Try to parse as JSON first
-        try:
-            json_body = json.loads(body_str)
-            if isinstance(json_body, dict) and "question" in json_body:
-                question = json_body["question"]
-            elif isinstance(json_body, str):
-                question = json_body
-        except json.JSONDecodeError:
-            # If not JSON, try to extract from string
-            if "{{prompt}}" in body_str:
-                # This is a promptfoo template string
-                question = body_str.replace("{{prompt}}", "").strip()
-            else:
-                # Try to extract question using patterns
-                patterns = [
-                    r'"question"\s*:\s*"([^"]+)"',  # JSON format
-                    r'question=([^&]+)',  # URL encoded
-                    r'question:\s*([^\n]+)',  # Plain text
-                ]
-                for pattern in patterns:
-                    matches = re.findall(pattern, body_str)
-                    if matches:
-                        question = matches[0].strip()
-                        break
+        # Try form data first
+        if "question" in form_data:
+            question = form_data["question"]
+        else:
+            # If not in form data, try JSON body
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    if "question" in body:
+                        question = body["question"]
+                    if "image" in body:
+                        image_path = body["image"]
+                elif isinstance(body, str):
+                    question = body
+            except json.JSONDecodeError:
+                # If not JSON, try to extract from raw body
+                body = (await request.body()).decode('utf-8')
+                if "{{prompt}}" in body:
+                    # This is a promptfoo template string
+                    question = body.replace("{{prompt}}", "").strip()
+                else:
+                    # Try to extract question using patterns
+                    patterns = [
+                        r'"question"\s*:\s*"([^"]+)"',  # JSON format
+                        r'question=([^&]+)',  # URL encoded
+                        r'question:\s*([^\n]+)',  # Plain text
+                    ]
+                    for pattern in patterns:
+                        matches = re.findall(pattern, body)
+                        if matches:
+                            question = matches[0].strip()
+                            break
         
         # Process image if provided
         image_data = None
         if image:
+            # Image uploaded via multipart form
             image_data = await image.read()
+        elif image_path:
+            # Image path provided in JSON body
+            try:
+                # Check if it's a base64-encoded image
+                if image_path.startswith("data:image/") or len(image_path) > 1000:
+                    # This looks like a base64-encoded image
+                    
+                    # Remove data URL prefix if present
+                    if image_path.startswith("data:image/"):
+                        # Extract base64 part after comma
+                        image_path = image_path.split(",", 1)[1]
+                    
+                    # Decode base64 to bytes
+                    image_data = base64.b64decode(image_path)
+                else:
+                    # Remove file:// prefix if present
+                    if image_path.startswith("file://"):
+                        image_path = image_path[7:]
+                    
+                    with open(image_path, 'rb') as f:
+                        image_data = f.read()
+            except Exception as e:
+                image_data = None
         
         if not question and not image_data:
             return JSONResponse(

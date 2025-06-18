@@ -23,6 +23,7 @@ from PIL import Image
 from io import BytesIO
 import asyncio
 import base64
+from functools import lru_cache
 
 # Load environment variables
 load_dotenv()
@@ -73,15 +74,6 @@ class SearchEngine:
         self.pc = Pinecone(api_key=PINECONE_API_KEY)
         self.index = self.pc.Index(INDEX_NAME)
         
-        # Debug: Check index stats
-        try:
-            stats = self.index.describe_index_stats()
-            print(f"Index stats: {stats}")
-            if 'namespaces' in stats:
-                print(f"Available namespaces: {list(stats['namespaces'].keys())}")
-        except Exception as e:
-            print(f"Error getting index stats: {e}")
-        
         # Load metadata for mapping indices to content
         print("Loading metadata...")
         with open("vector_store/md_metadata.pkl", "rb") as f:
@@ -101,6 +93,13 @@ class SearchEngine:
             except Exception as e:
                 print(f"Error loading file {file_path}: {str(e)}")
         
+        # Initialize word statistics
+        print("Initializing word statistics...")
+        self.word_frequencies = {}
+        self.idf_scores = {}
+        self.total_documents = 0
+        self._initialize_word_statistics()
+        
         # Initialize Gemini AI model
         print("Initializing Gemini model...")
         GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -110,6 +109,115 @@ class SearchEngine:
         self.gemini = genai.GenerativeModel('gemini-1.5-flash')
         
         print("SearchEngine initialization complete")
+
+    def _initialize_word_statistics(self):
+        """Initialize word statistics from existing documents."""
+        print("Calculating word statistics from documents...")
+        
+        # Process markdown content
+        for meta in self.md_metadata:
+            content = self.md_content.get(meta["filename"], "")
+            self._update_word_stats(content)
+            self.total_documents += 1
+        
+        # Process forum posts
+        for meta in self.json_metadata:
+            content = meta.get("content", "")
+            self._update_word_stats(content)
+            self.total_documents += 1
+        
+        # Calculate IDF scores
+        self._calculate_idf_scores()
+        
+        print(f"Processed word statistics from {self.total_documents} documents")
+
+    def _update_word_stats(self, text: str):
+        """Update word frequency statistics."""
+        # Normalize text and get unique words
+        words = set(text.lower().split())
+        
+        # Update document frequencies
+        for word in words:
+            if len(word) >= 3:  # Only track words of 3+ characters
+                self.word_frequencies[word] = self.word_frequencies.get(word, 0) + 1
+
+    def _calculate_idf_scores(self):
+        """Calculate IDF scores for all words."""
+        import math
+        
+        for word, doc_freq in self.word_frequencies.items():
+            # IDF = log(total documents / number of documents containing the word)
+            self.idf_scores[word] = math.log(self.total_documents / (1 + doc_freq))
+
+    @lru_cache(maxsize=1000)
+    def _get_word_importance(self, word: str) -> float:
+        """
+        Determine importance of a word based on its IDF score and characteristics.
+        Uses caching to speed up repeated lookups.
+        """
+        word = word.lower()
+        
+        # Very short words are likely not important
+        if len(word) < 3:
+            return 0.0
+        
+        # Base importance from IDF score (normalized to 0-1 range)
+        idf_score = self.idf_scores.get(word, 0)
+        importance = min(1.0, idf_score / 10)  # Normalize IDF score
+        
+        # Boost importance based on word characteristics
+        if any(c.isupper() for c in word):  # Contains uppercase
+            importance *= 1.5
+            
+        if any(c.isdigit() for c in word):  # Contains numbers
+            importance *= 1.4
+            
+        if '_' in word or '-' in word:  # Contains separators
+            importance *= 1.3
+        
+        return min(1.0, importance)
+
+    def _calculate_keyword_importance(self, query: str, title: str, content: str) -> float:
+        """Calculate score based on keyword importance using IDF scores."""
+        # Process query words
+        query_words = query.lower().split()
+        query_tf = {}
+        for word in query_words:
+            query_tf[word] = query_tf.get(word, 0) + 1
+        
+        # Calculate importance for each word
+        important_words = {}
+        max_tf = max(query_tf.values()) if query_tf else 1
+        
+        for word, tf in query_tf.items():
+            if word not in important_words:
+                # Combine TF and word importance
+                normalized_tf = tf / max_tf
+                word_importance = self._get_word_importance(word)
+                importance = normalized_tf * word_importance
+                
+                if importance > 0.1:  # Only keep somewhat important words
+                    important_words[word] = importance
+        
+        # Calculate match score
+        score = 0.0
+        matched_words = set()
+        
+        for word, importance in important_words.items():
+            if word in matched_words:
+                continue
+            
+            # Check title matches (higher weight)
+            if word in title.lower():
+                score += 0.6 * importance
+                matched_words.add(word)
+            
+            # Check content matches
+            if word in content.lower():
+                score += 0.4 * importance
+                matched_words.add(word)
+        
+        return min(1.0, score)
 
     def _normalize_url(self, url: str, post_number: Optional[int] = None) -> str:
         """Normalize URL to use exact format: BASE_URL/t/title-slug/topic_id/post_number"""
@@ -243,11 +351,12 @@ class SearchEngine:
                         if is_forum:
                             url = self._normalize_url(url, meta.get("post_number"))
                         
-                        # Calculate additional scores
-                        phrase_score = self._calculate_phrase_match_score(combined_query, title, content)
-                        context_score = self._calculate_context_score(combined_query, title, content)
+                        # Calculate keyword importance score instead of phrase matching
+                        keyword_score = self._calculate_keyword_importance(combined_query, title, content)
                         
-                        # Calculate term overlap
+                        # Calculate term overlap for context
+                        query_terms = set(combined_query.lower().split())
+                        important_terms = {term for term in query_terms if len(term) > 3}
                         title_terms = set(title.split())
                         content_terms = set(content.split())
                         term_overlap = len(important_terms.intersection(title_terms)) / len(important_terms) * (0.4 if not is_forum else 0.5) + \
@@ -287,9 +396,8 @@ class SearchEngine:
                         # Combine scores with higher weight for forum posts
                         final_score = (
                             score * 0.6 +  # Pinecone similarity score
-                            phrase_score * (0.2 if not is_forum else 0.25) +
-                            context_score * 0.05 +
-                            term_overlap * (0.15 if not is_forum else 0.2)
+                            keyword_score * (0.25 if not is_forum else 0.3) +  # Keyword importance
+                            term_overlap * (0.15 if not is_forum else 0.1)  # Term overlap
                         )
                         
                         if final_score < min_score:
@@ -348,46 +456,6 @@ class SearchEngine:
             print(traceback.format_exc())
             return []
 
-    def _calculate_phrase_match_score(self, query: str, title: str, content: str) -> float:
-        """Calculate score based on exact phrase matches."""
-        # Extract important phrases from query (2+ words)
-        query_words = query.split()
-        phrases = []
-        for i in range(len(query_words) - 1):
-            phrases.append(" ".join(query_words[i:i+2]))
-        
-        # Check for exact phrase matches
-        score = 0.0
-        for phrase in phrases:
-            if phrase in title:
-                score += 0.5  # Higher weight for title matches
-            if phrase in content:
-                score += 0.3  # Lower weight for content matches
-        
-        return min(1.0, score)  # Cap at 1.0
-
-    def _calculate_context_score(self, query: str, title: str, content: str) -> float:
-        """Calculate how well the content matches the query context."""
-        # Extract key terms and their context
-        query_terms = set(query.split())
-        title_terms = set(title.split())
-        
-        # Calculate term overlap
-        term_overlap = len(query_terms.intersection(title_terms)) / len(query_terms)
-        
-        # Check for term proximity in content
-        proximity_score = 0.0
-        if content:
-            words = content.split()
-            for i, word in enumerate(words):
-                if word in query_terms:
-                    # Check surrounding context (3 words before and after)
-                    context = words[max(0, i-3):min(len(words), i+4)]
-                    context_terms = set(context)
-                    proximity_score += len(query_terms.intersection(context_terms)) / len(query_terms)
-        
-        return (term_overlap * 0.6 + min(1.0, proximity_score) * 0.4)
-
     async def generate_answer(self, question: str, search_results: List[Dict]) -> Dict:
         """
         Generate an answer using Gemini AI based on search results.
@@ -439,7 +507,7 @@ Here are the relevant course materials or forum posts (sorted by relevance):
 {sources_text}
 
 CRITICAL INSTRUCTIONS:
-1. You MUST use the provided course materials to answer the question
+1. You MUST use the provided course materials and forum poststo answer the question
 2. Pay special attention to responses from:
    - Course Instructors (@iamprasna, @carlton)
    - Teaching Assistants (@Jivraj @HritikRoshan_HRM)

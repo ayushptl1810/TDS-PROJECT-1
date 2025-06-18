@@ -9,13 +9,16 @@ This project implements an AI-powered teaching assistant that can answer student
 ## Features
 
 - **Semantic Search**: Uses Pinecone's `llama-text-embed-v2-index` for high-quality semantic search over course content
+- **Smart Content Processing**: Intelligent chunking preserves semantic meaning while handling large documents
 - **Multi-Source Knowledge**: Combines information from:
-  - Course website materials
+  - Course website materials (with full context preservation)
   - Forum discussions
   - Student-TA interactions
 - **Smart Answer Generation**: Uses Gemini AI to generate contextual, accurate responses
 - **Source Attribution**: Provides links to original sources for verification
 - **Image Support**: Can process images in questions using Gemini's vision capabilities
+- **Adaptive Learning**: Automatically identifies important technical terms using TF-IDF analysis
+- **Robust Error Handling**: Rate limit management and retry logic for reliable operation
 
 ## Search Architecture
 
@@ -27,7 +30,7 @@ The system employs a sophisticated multi-type search strategy that combines vect
    - Searches across two namespaces: course materials and forum posts
    - Initial filtering of results with scores < 0.1
 
-2. **Dynamic Keyword Importance** (25-30% weight):
+2. **Dynamic Keyword Importance** (25% weight):
 
    - Uses TF-IDF (Term Frequency-Inverse Document Frequency) to identify important terms
    - Automatically learns word importance from the document collection
@@ -37,23 +40,31 @@ The system employs a sophisticated multi-type search strategy that combines vect
      - Words containing numbers or special characters
    - Caches word importance calculations for efficiency
 
-3. **Term Overlap** (10-15% weight):
+3. **Term Overlap** (15% weight):
 
    - Measures intersection between query terms and content
-   - Different weights for title (0.4-0.5) and content (0.8-0.9)
-   - Higher weights for forum posts vs. course materials
+   - Equal weights for both course materials and forum posts
 
-4. **Forum Context Enhancement**:
+4. **Smart Content Processing**:
+
+   - **Intelligent Chunking**: Course content is split into semantic chunks (up to 3000 characters each) while preserving paragraph and sentence boundaries
+   - **Smart Content Selection**: For longer documents, selects the most relevant sections based on keyword importance
+   - **Deduplication**: Multiple chunks from the same document are combined and scored together
+   - **Full Context**: Gemini receives complete document content for better understanding
+
+5. **Forum Context Enhancement**:
    - Includes parent and child posts for forum results
    - Maintains conversation context
    - Considers author roles (instructor/TA/student)
 
-The system dynamically learns what terms are important based on their usage patterns in the course materials and forum posts, rather than relying on predefined rules or stop words. This allows it to:
+The system dynamically learns what terms are important based on their usage patterns in the course materials and forum posts and provides comprehensive answers that combine both course materials and forum discussions, rather than relying on predefined rules or stop words. This allows it to:
 
 - Automatically identify technical and course-specific terminology
 - Adapt to new terminology as it appears in the course
 - Reduce the impact of common, non-informative words
 - Cache frequent calculations for better performance
+- Preserve semantic meaning when processing long documents
+- Provide comprehensive answers that combine both course materials and forum discussions
 
 The final score is a weighted combination of these factors, with results below the minimum threshold (default: 0.15) being filtered out. Results are then sorted by final score and returned with their original sources.
 

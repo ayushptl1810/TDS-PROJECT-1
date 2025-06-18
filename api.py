@@ -310,10 +310,6 @@ class SearchEngine:
             async def search_namespace(namespace: str, metadata_list: List[Dict], content_dict=None, is_forum=False):
                 try:
                     # Query Pinecone with the combined query using the correct API format
-                    print(f"Querying Pinecone with: {combined_query[:100]}...")
-                    print(f"Namespace: {namespace}")
-                    
-                    # Use the correct Pinecone API format for semantic search
                     results = self.index.search(
                         namespace=namespace,
                         query={
@@ -347,6 +343,13 @@ class SearchEngine:
                         title = meta.get("title", "").lower()
                         content = content_dict.get(meta["filename"], "") if content_dict else meta.get("content", "").lower()
                         url = meta.get("url", "")
+                        
+                        # For chunked content, get the full content from the file
+                        if content_dict and meta.get("chunk_index") is not None:
+                            # Get the full content from the file
+                            full_content = content_dict.get(meta["filename"], "")
+                            if full_content:
+                                content = full_content.lower()
                         
                         if is_forum:
                             url = self._normalize_url(url, meta.get("post_number"))
@@ -393,11 +396,11 @@ class SearchEngine:
                                     "is_parent": False
                                 })
                         
-                        # Combine scores with higher weight for forum posts
+                        # Combine scores with equal weights for both content types
                         final_score = (
                             score * 0.6 +  # Pinecone similarity score
-                            keyword_score * (0.25 if not is_forum else 0.3) +  # Keyword importance
-                            term_overlap * (0.15 if not is_forum else 0.1)  # Term overlap
+                            keyword_score * 0.25 +  # Keyword importance
+                            term_overlap * 0.15  # Term overlap
                         )
                         
                         if final_score < min_score:
@@ -407,7 +410,7 @@ class SearchEngine:
                             "score": final_score,
                             "title": meta.get("title", ""),
                             "url": url,
-                            "content": content[:200] + "..." if len(content) > 200 else content,
+                            "content": content,  # Don't truncate - let the cleaning function handle it
                             "source": "markdown" if content_dict else "forum_post",
                             "author": meta.get("author", "").lower()
                         }
@@ -427,25 +430,38 @@ class SearchEngine:
             md_results = await search_namespace("markdown-content", self.md_metadata, self.md_content, False)
             json_results = await search_namespace("forum-posts", self.json_metadata, None, True)
             
-            # Debug: Print search results
-            print(f"Markdown results: {len(md_results)}")
-            print(f"Forum results: {len(json_results)}")
-            if md_results:
-                print(f"Top markdown result: {md_results[0].get('title', 'No title')} - Score: {md_results[0].get('score', 0)}")
-            if json_results:
-                print(f"Top forum result: {json_results[0].get('title', 'No title')} - Score: {json_results[0].get('score', 0)}")
-            
             # Combine and sort results
             all_results = []
             all_results.extend(md_results)
             all_results.extend(json_results)
             all_results.sort(key=lambda x: x["score"], reverse=True)
             
-            print(f"Total combined results: {len(all_results)}")
-            if all_results:
-                print(f"Best overall result: {all_results[0].get('title', 'No title')} - Score: {all_results[0].get('score', 0)}")
+            # Deduplicate results from the same document (for chunked content)
+            deduplicated_results = []
+            seen_documents = set()
             
-            return all_results[:top_k]
+            for result in all_results:
+                if result["source"] == "markdown":
+                    # For markdown content, use filename as document identifier
+                    doc_id = result.get("title", "")  # Use title as document identifier
+                else:
+                    # For forum posts, use topic_id + post_number
+                    doc_id = f"{result.get('url', '')}"
+                
+                if doc_id not in seen_documents:
+                    seen_documents.add(doc_id)
+                    deduplicated_results.append(result)
+                else:
+                    # If we've seen this document before, update the score
+                    existing_result = next(r for r in deduplicated_results if 
+                        (r["source"] == "markdown" and r.get("title", "") == doc_id) or
+                        (r["source"] == "forum_post" and r.get("url", "") == doc_id))
+                    existing_result["score"] = max(existing_result["score"], result["score"])
+            
+            # Re-sort by updated scores
+            deduplicated_results.sort(key=lambda x: x["score"], reverse=True)
+            
+            return deduplicated_results[:top_k]
             
         except Exception as e:
             import traceback
@@ -489,7 +505,7 @@ class SearchEngine:
                 f"Title: {r.get('title', 'No title')}\n"
                 f"URL: {r['url']}\n"
                 f"Author: {r.get('author', 'Unknown')} ({r.get('role', 'Student')})\n"
-                f"Content:\n{r['content'][:500]}..."
+                f"Content:\n{self._clean_content_for_gemini(r['content'])}"
                 + (f"\n\nContext:\n" + "\n".join([
                     f"{'Parent post' if ctx.get('is_parent') else 'Reply'} by {ctx['author']}:\n{ctx['content'][:200]}..."
                     for ctx in r.get('context', [])
@@ -497,64 +513,72 @@ class SearchEngine:
                 for i, r in enumerate(search_results[:5])
             ])
 
-            # Updated prompt to emphasize handling contradictory statements and exact response format
-            prompt = f"""You are a Teaching Assistant for the Tools in Data Science course at IIT Madras. Your task is to answer student questions using the provided course materials.
+            # Updated prompt to better balance course materials and forum posts
+            prompt = f"""You are a Teaching Assistant for the Tools in Data Science course at IIT Madras. Your task is to answer student questions using the provided course materials and forum discussions.
 
 Question: {question}
 
-Here are the relevant course materials or forum posts (sorted by relevance):
+Here are the relevant course materials and forum posts (sorted by relevance):
 
 {sources_text}
 
 CRITICAL INSTRUCTIONS:
-1. You MUST use the provided course materials and forum poststo answer the question
-2. Pay special attention to responses from:
-   - Course Instructors (@iamprasna, @carlton)
-   - Teaching Assistants (@Jivraj @HritikRoshan_HRM)
-3. For specific topics, prioritize:
-   - Assignment/Project queries: TA responses
-   - Quiz queries: @iamprasna's responses
-   - ROE/Exam queries: @carlton's responses
-4. Consider the FULL context of forum posts, including parent posts and replies
-5. If a post is part of a conversation, consider the entire thread for context
-6. Consider ALL provided sources, not just the highest scoring one
-7. If multiple sources have relevant information, combine them in your answer
-8. You MUST include the exact URLs from ALL relevant sources in your answer
-9. For handling contradictory statements:
+1. You MUST use BOTH course materials and forum posts to answer the question
+2. Source Priority:
+   A. Official Course Materials:
+      - Course website content
+      - Official documentation
+      - Assignment specifications
+      - Course guidelines
+   B. Forum Posts (in order of priority):
+      - Course Instructor responses (@iamprasna, @carlton)
+      - Teaching Assistant responses (@Jivraj @HritikRoshan_HRM)
+      - Student discussions
+3. When using sources:
+   - Start with relevant course materials
+   - Supplement with forum discussions for clarification or real examples
+   - If course materials and forum posts differ, use course materials
+   - For implementation details or practical tips, consider both equally
+4. Consider ALL provided sources:
+   - Look at both course materials and forum posts
+   - Combine information when appropriate
+   - Cross-reference between materials and discussions
+5. Include exact URLs from ALL relevant sources
+6. For specific queries:
+   - Technical questions: Use both documentation and practical examples
+   - Assignment questions: Combine official specs with TA clarifications
+   - Tool usage: Reference both official guides and user experiences
+7. For handling contradictory statements:
    - ALWAYS prioritize official course materials over forum posts
    - If forum posts contradict each other, prioritize in this order:
      1. Course Instructor responses (@iamprasna, @carlton)
      2. Teaching Assistant responses (@Jivraj @HritikRoshan_HRM)
      3. Student responses (only if no instructor/TA response exists)
-   - If an instructor/TA later corrects or updates information, use their latest response
-   - If there are multiple instructor/TA responses, use the most recent one
-   - If contradictions exist between instructors/TAs, prioritize the course instructor's response
-10. For questions about specific requirements or scores:
+8. For questions about specific requirements or scores:
     - Extract and state the EXACT numbers/values mentioned
     - If there are multiple values, explain which one applies based on instructor/TA priority
     - If a value is not explicitly stated, say so clearly
     - When describing score calculations, use the EXACT format mentioned in the sources
     - Do not make assumptions about score formats not explicitly stated
-11. For questions about tools or software:
+9. For questions about tools or software:
     - State clearly whether something is allowed or not allowed
     - If alternatives are mentioned, list ALL options with their specific conditions
     - If there are restrictions, state them explicitly
     - When discussing alternatives, explain the exact implications of each choice
     - If students suggest alternatives not mentioned by instructors/TAs, note this explicitly
-12. For questions about dates or deadlines:
+10. For questions about dates or deadlines:
     - State the EXACT date if available
     - If a date is not available, explain why (e.g., not yet announced)
     - If there are multiple dates, clarify which is which
     - If dates are updated, use the most recent instructor/TA announcement
-13. Only say "I don't know" if NONE of the sources have relevant information
-14. Format your response EXACTLY as follows:
+11. Format your response EXACTLY as follows:
 
-Answer: [your answer using ALL relevant sources, being explicit about specific values, requirements, or restrictions]
+Answer: [your answer using BOTH course materials and forum posts, being explicit about requirements and practical implementation]
 
 Sources:
-1. URL: [exact_url_1], Text: [brief quote or description with specific values]
-2. URL: [exact_url_2], Text: [brief quote or description with specific values]
-[Include ALL relevant sources, not just the highest scoring one]"""
+1. URL: [exact_url_1], Text: [brief quote or description]
+2. URL: [exact_url_2], Text: [brief quote or description]
+[Include ALL relevant sources, both course materials and forum posts not just the highest scoring one]"""
 
             # Generate with very low temperature for consistency
             response = self.gemini.generate_content(
@@ -662,6 +686,70 @@ Sources:
                 "answer": "I don't know the answer as I encountered an error while processing your request.",
                 "links": []
             }
+
+    def _clean_content_for_gemini(self, content: str) -> str:
+        """Clean content for sending to Gemini by removing frontmatter and selecting relevant sections."""
+        if not content:
+            return ""
+        
+        # Remove frontmatter (everything between --- markers)
+        content = re.sub(r'^---.*?---\s*', '', content, flags=re.DOTALL | re.MULTILINE)
+        
+        # Clean up extra whitespace
+        content = re.sub(r'\n\s*\n', '\n\n', content)
+        content = content.strip()
+        
+        # If content is short enough, return it all
+        if len(content) <= 3000:
+            return content
+        
+        # For longer content, use smart selection
+        return self._select_relevant_sections(content, max_chars=3000)
+    
+    def _select_relevant_sections(self, content: str, max_chars: int = 3000) -> str:
+        """Select the most relevant sections of content based on keyword importance."""
+        # Split content into paragraphs
+        paragraphs = content.split('\n\n')
+        
+        # Score each paragraph based on keyword importance
+        scored_paragraphs = []
+        for paragraph in paragraphs:
+            if len(paragraph.strip()) < 50:  # Skip very short paragraphs
+                continue
+            
+            # Calculate importance score for this paragraph
+            words = paragraph.lower().split()
+            importance_score = sum(self._get_word_importance(word) for word in words if len(word) >= 3)
+            avg_importance = importance_score / len(words) if words else 0
+            
+            scored_paragraphs.append((paragraph, avg_importance))
+        
+        # Sort by importance score (highest first)
+        scored_paragraphs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select paragraphs until we reach the character limit
+        selected_content = []
+        current_length = 0
+        
+        for paragraph, score in scored_paragraphs:
+            if current_length + len(paragraph) <= max_chars:
+                selected_content.append(paragraph)
+                current_length += len(paragraph)
+            else:
+                # If this paragraph is very important and we have space for part of it
+                if score > 0.5 and current_length < max_chars - 200:
+                    # Take the first part of the paragraph
+                    remaining_chars = max_chars - current_length - 100  # Leave space for "..."
+                    if remaining_chars > 100:
+                        selected_content.append(paragraph[:remaining_chars] + "...")
+                break
+        
+        # If we didn't select enough content, add some from the beginning
+        if current_length < 1000 and len(content) > 1000:
+            # Add the first 1000 characters as context
+            selected_content.insert(0, content[:1000] + "...")
+        
+        return '\n\n'.join(selected_content)
 
 @app.get("/")
 async def root():

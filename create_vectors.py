@@ -186,6 +186,64 @@ def create_pinecone_index():
         else:
             raise e
 
+def smart_chunk_content(content: str, max_chars: int = 3000) -> list:
+    """
+    Intelligently chunk content while preserving semantic meaning.
+    Tries to break at sentence boundaries and paragraph breaks.
+    """
+    if len(content) <= max_chars:
+        return [content]
+    
+    chunks = []
+    current_chunk = ""
+    
+    # Split by paragraphs first
+    paragraphs = content.split('\n\n')
+    
+    for paragraph in paragraphs:
+        # If adding this paragraph would exceed limit
+        if len(current_chunk) + len(paragraph) > max_chars and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = paragraph
+        else:
+            if current_chunk:
+                current_chunk += "\n\n" + paragraph
+            else:
+                current_chunk = paragraph
+    
+    # Add the last chunk
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    # If any chunk is still too long, split by sentences
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            final_chunks.append(chunk)
+        else:
+            # Split by sentences
+            sentences = re.split(r'[.!?]+', chunk)
+            current_sentence_chunk = ""
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                    
+                if len(current_sentence_chunk) + len(sentence) > max_chars and current_sentence_chunk:
+                    final_chunks.append(current_sentence_chunk.strip())
+                    current_sentence_chunk = sentence
+                else:
+                    if current_sentence_chunk:
+                        current_sentence_chunk += ". " + sentence
+                    else:
+                        current_sentence_chunk = sentence
+            
+            if current_sentence_chunk:
+                final_chunks.append(current_sentence_chunk.strip())
+    
+    return final_chunks
+
 def create_md_vectors(index):
     """
     Create vector embeddings for markdown files in the tds_pages_md directory.
@@ -233,38 +291,47 @@ def create_md_vectors(index):
                 content_keywords = set(re.findall(r'\b\w+\b', content.lower()))
                 keywords = title_keywords.union(content_keywords)
                 
-                # Create structured search text (truncated to reduce size)
-                search_text = f"""Title: {title[:100]}
-Content: {content[:1000]}
-Keywords: {', '.join(list(keywords)[:5])}"""
+                # Use smart chunking to preserve semantic meaning
+                content_chunks = smart_chunk_content(content, max_chars=3000)
                 
-                # Only construct URL if not found in frontmatter
-                if not original_url:
-                    # Remove any .md extension and convert to URL format
-                    url_path = filename.replace(".md", "").lower()
-                    # Convert filename to URL format
-                    url_path = url_path.replace("__", "-").replace("_", "-")
-                    original_url = f"https://tds.s-anand.net/#/{url_path}"
-                
-                # Create unique ID for the record
-                record_id = f"md_{filename.replace('.md', '')}"
-                
-                # Prepare record for Pinecone
-                record = {
-                    "id": record_id,
-                    "text": search_text
-                }
-                
-                records.append(record)
-                
-                # Store minimal metadata to stay under 40KB limit
-                metadata_list.append({
-                    "id": record_id,
-                    "filename": filename,
-                    "title": title[:100],  # Truncate title further
-                    "url": original_url,
-                    "type": "markdown"
-                })
+                # Create multiple records for different chunks
+                for chunk_idx, chunk_content in enumerate(content_chunks):
+                    # Create structured search text with full chunk content
+                    search_text = f"""Title: {title[:100]}
+Content: {chunk_content}
+Keywords: {', '.join(list(keywords)[:10])}"""
+                    
+                    # Only construct URL if not found in frontmatter
+                    if not original_url:
+                        # Remove any .md extension and convert to URL format
+                        url_path = filename.replace(".md", "").lower()
+                        # Convert filename to URL format
+                        url_path = url_path.replace("__", "-").replace("_", "-")
+                        original_url = f"https://tds.s-anand.net/#/{url_path}"
+                    
+                    # Create unique ID for the record (include chunk index)
+                    chunk_suffix = f"_chunk_{chunk_idx}" if len(content_chunks) > 1 else ""
+                    record_id = f"md_{filename.replace('.md', '')}{chunk_suffix}"
+                    
+                    # Prepare record for Pinecone
+                    record = {
+                        "id": record_id,
+                        "text": search_text
+                    }
+                    
+                    records.append(record)
+                    
+                    # Store metadata with chunk information
+                    metadata_list.append({
+                        "id": record_id,
+                        "filename": filename,
+                        "title": title[:100],
+                        "url": original_url,
+                        "type": "markdown",
+                        "chunk_index": chunk_idx,
+                        "total_chunks": len(content_chunks),
+                        "content_preview": chunk_content[:200] + "..." if len(chunk_content) > 200 else chunk_content
+                    })
                 
         except Exception as e:
             print(f"Error processing {filename}: {str(e)}")
@@ -423,16 +490,69 @@ Author: {post_metadata['author']} ({post_metadata['role']})"""
         
         # Upsert records in batches
         batch_size = 90
+        successful_uploads = 0
+        failed_batches = []
+        
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
-            try:
-                index.upsert_records(
-                    namespace="forum-posts",
-                    records=batch
-                )
-                print(f"Upserted batch {i//batch_size + 1}/{(len(records) + batch_size - 1)//batch_size}")
-            except Exception as e:
-                print(f"Error upserting batch {i//batch_size + 1}: {str(e)}")
+            batch_num = i//batch_size + 1
+            max_retries = 5
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    index.upsert_records(
+                        namespace="forum-posts",
+                        records=batch
+                    )
+                    successful_uploads += len(batch)
+                    print(f"Upserted batch {batch_num}/{(len(records) + batch_size - 1)//batch_size}")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    if "429" in str(e) or "rate limit" in str(e).lower():
+                        # Rate limit error - wait with exponential backoff
+                        wait_time = min(60, 2 ** retry_count)  # Max 60 seconds
+                        print(f"Rate limit hit for batch {batch_num} (attempt {retry_count}). Waiting {wait_time} seconds...")
+                        import time
+                        time.sleep(wait_time)
+                    else:
+                        print(f"Error upserting batch {batch_num}: {str(e)}")
+                        break
+                    
+                    if retry_count >= max_retries:
+                        print(f"Failed to upload batch {batch_num} after {max_retries} attempts")
+                        failed_batches.append((i, batch))
+        
+        # Retry failed batches with smaller batch sizes
+        if failed_batches:
+            print(f"\nRetrying {len(failed_batches)} failed batches with smaller batch sizes...")
+            for start_idx, batch in failed_batches:
+                # Try with half the batch size
+                half_batch_size = len(batch) // 2
+                for j in range(0, len(batch), half_batch_size):
+                    sub_batch = batch[j:j + half_batch_size]
+                    try:
+                        index.upsert_records(
+                            namespace="forum-posts",
+                            records=sub_batch
+                        )
+                        successful_uploads += len(sub_batch)
+                        print(f"Successfully uploaded sub-batch from failed batch")
+                    except Exception as e:
+                        print(f"Failed to upload sub-batch: {str(e)}")
+                        # Try individual uploads as last resort
+                        for record in sub_batch:
+                            try:
+                                index.upsert_records(
+                                    namespace="forum-posts",
+                                    records=[record]
+                                )
+                                successful_uploads += 1
+                            except Exception as individual_error:
+                                print(f"Failed to upload individual record: {str(individual_error)}")
+        
+        print(f"\nUpload summary: {successful_uploads}/{len(records)} records uploaded successfully")
         
         # Save metadata locally for reference
         os.makedirs("vector_store", exist_ok=True)
@@ -444,6 +564,7 @@ Author: {post_metadata['author']} ({post_metadata['role']})"""
         print(f"Successfully processed: {processed_count} posts")
         print(f"Errors encountered: {error_count} posts")
         print(f"Total records created: {len(records)}")
+        print(f"Successfully uploaded: {successful_uploads} records")
     else:
         print("No records created - no valid posts found")
 
@@ -474,6 +595,37 @@ def check_and_fix_markdown_vectors(index):
     else:
         print("All markdown files are uploaded successfully!")
 
+def check_and_fix_forum_vectors(index):
+    """
+    Check what forum posts are in the Pinecone index and re-upload missing ones.
+    """
+    print("Checking forum vectors in Pinecone index...")
+    
+    # Get index stats
+    stats = index.describe_index_stats()
+    if 'namespaces' in stats and 'forum-posts' in stats['namespaces']:
+        current_count = stats['namespaces']['forum-posts']['vector_count']
+        print(f"Current forum vectors in index: {current_count}")
+    else:
+        current_count = 0
+        print("No forum-posts namespace found")
+    
+    # Check how many forum posts we should have
+    try:
+        with open("tds_forum_posts.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        expected_count = len(data["posts"])
+        print(f"Expected forum posts: {expected_count}")
+    except Exception as e:
+        print(f"Error checking expected forum posts: {str(e)}")
+        return
+    
+    if current_count < expected_count:
+        print(f"Missing {expected_count - current_count} forum posts. Re-uploading...")
+        create_json_vectors(index)
+    else:
+        print("All forum posts are uploaded successfully!")
+
 if __name__ == "__main__":
     # Create vector store directory if it doesn't exist (for metadata storage)
     os.makedirs("vector_store", exist_ok=True)
@@ -484,7 +636,7 @@ if __name__ == "__main__":
     # Check and fix markdown vectors
     check_and_fix_markdown_vectors(index)
     
-    # Create vectors for forum posts
-    create_json_vectors(index)
+    # Check and fix forum vectors
+    check_and_fix_forum_vectors(index)
     
     print("Pinecone vector store creation complete!") 

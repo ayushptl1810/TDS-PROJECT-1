@@ -78,6 +78,11 @@ The final score is a weighted combination of these factors, with results below t
 ├── requirements.txt       # Python dependencies
 ├── vector_store/         # Directory for vector store metadata
 ├── tds_pages_md/        # Scraped markdown content
+├── app/                  # Streamlit frontend application
+│   ├── streamlit_app.py  # Main Streamlit UI
+│   └── utils/            # Utility functions
+└── .streamlit/           # Streamlit configuration (optional)
+    └── config.toml       # Production settings
 ```
 
 ## Key Components
@@ -181,7 +186,61 @@ curl -X POST http://localhost:8000/api \
 
 ## Deployment
 
-The project is deployment on Render so it may take few seconds to start up.
+### Backend (FastAPI)
+
+The project is deployed on Render so it may take a few seconds to start up.
+
+**Environment Variables Required:**
+
+- `PINECONE_API_KEY`: Your Pinecone API key
+- `GOOGLE_API_KEY`: Your Google Gemini API key
+- `_t`: Discourse forum token for forum access
+
+**Deploy Command:**
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port $PORT
+```
+
+### Frontend (Streamlit)
+
+The Streamlit frontend can be deployed separately and connects to your FastAPI backend.
+
+**Local Development:**
+
+```bash
+# Set the API endpoint
+export API_BASE_URL="https://your-api.onrender.com"
+
+# Run the Streamlit app
+streamlit run app/streamlit_app.py
+```
+
+**Deployment Options:**
+
+1. **Streamlit Cloud:**
+
+   - Connect your GitHub repository
+   - Set main file path: `app/streamlit_app.py`
+   - Add secret: `API_BASE_URL` = `https://your-api.onrender.com`
+
+2. **Render (Web Service):**
+
+   - Build command: `pip install streamlit requests`
+   - Start command: `streamlit run app/streamlit_app.py --server.port $PORT --server.address 0.0.0.0`
+   - Environment variable: `API_BASE_URL=https://your-api.onrender.com`
+
+3. **Other Platforms:**
+   - Ensure `API_BASE_URL` environment variable points to your FastAPI backend
+   - Use port from `$PORT` environment variable
+
+**Features:**
+
+- Text question interface
+- Image upload and analysis
+- Source attribution with clickable links
+- API health monitoring
+- Responsive design optimized for production
 
 ## License
 
